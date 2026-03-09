@@ -1,0 +1,8 @@
+torch>=2.1.0
+torchaudio>=2.1.0
+transformers>=4.49.0
+huggingface_hub>=0.21.0
+numpy
+onnxruntime>=1.19.0
+onnx>=1.16.0
+gdown>=5.1.0

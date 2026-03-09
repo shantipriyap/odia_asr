@@ -1,0 +1,30 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Data — raw audio and tarballs (too large for git)
+data/raw/
+
+# Training outputs and checkpoints
+outputs/
+
+# Manifests (generated, not committed)
+data/manifests/
+
+# Secrets — never commit tokens
+.env
+*.env
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+nohup.out
+
+# Jupyter checkpoints
+.ipynb_checkpoints/

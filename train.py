@@ -23,18 +23,27 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchaudio
+import soundfile as sf
+import onnxruntime as ort
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModel
 from typing import List, Tuple
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CONFIG DEFAULTS
+def _default_test_manifest():
+    """Prefer IWSLT test manifest if available, fall back to OpenSLR test."""
+    iwslt = "data/manifests/odia_iwslt_test_manifest.json"
+    openslr = "data/manifests/odia_test_manifest.json"
+    return iwslt if os.path.exists(iwslt) else openslr
+
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 DEFAULTS = dict(
     model_id        = "ai4bharat/indic-conformer-600m-multilingual",
     lang_id         = "or",                    # Odia ISO code
     train_manifest  = "data/manifests/odia_train_manifest.json",
-    test_manifest   = "data/manifests/odia_test_manifest.json",
+    test_manifest   = "data/manifests/odia_test_manifest.json",       # OpenSLR test
+    iwslt_manifest  = "data/manifests/odia_iwslt_test_manifest.json", # IWSLT 2026 test
     output_dir      = "outputs/odia_finetuned",
     target_sr       = 16000,   # model expects 16 kHz
     source_sr       = 8000,    # OpenSLR-103 Odia is 8 kHz
@@ -51,6 +60,7 @@ DEFAULTS = dict(
     log_interval    = 50,
     eval_every_n_epochs = 1,
     hf_token        = os.environ.get("HF_TOKEN", ""),
+    hf_push_repo    = "shantipriya/odia-asr",   # push best checkpoint here; set "" to disable
 )
 
 
@@ -148,19 +158,18 @@ class OdiaASRDataset(Dataset):
 
     def __getitem__(self, idx):
         rec = self.data[idx]
-        wav, sr = torchaudio.load(rec["audio_filepath"])
-        wav = torch.mean(wav, dim=0, keepdim=True)  # mono
+        # Use soundfile directly to avoid torchaudio backend issues
+        samples, sr = sf.read(rec["audio_filepath"], dtype="float32", always_2d=False)
+        wav = torch.from_numpy(samples)
+        if wav.dim() == 2:
+            wav = wav.mean(1)  # (T, C) → mono
 
         if sr != self.target_sr:
             if sr == self.source_sr:
-                wav = self.resampler(wav)
+                wav = self.resampler(wav.unsqueeze(0)).squeeze(0)
             else:
-                resampler = torchaudio.transforms.Resample(
-                    orig_freq=sr, new_freq=self.target_sr
-                )
-                wav = resampler(wav)
+                wav = torchaudio.functional.resample(wav.unsqueeze(0), sr, self.target_sr).squeeze(0)
 
-        wav = wav.squeeze(0)  # (T,)
         label = self.tokenizer.encode(rec["text"])
         return wav, torch.tensor(label, dtype=torch.long)
 
@@ -181,54 +190,62 @@ def collate_fn(batch: List[Tuple[torch.Tensor, torch.Tensor]]):
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CTC WRAPPER
-# Wraps IndicConformer encoder + linear CTC projection
+# IndicConformer-600M pipeline:
+#   preprocessor  → NeMo TorchScript (runs on CUDA, outputs 80-dim mel)
+#   encoder       → ONNX InferenceSession (CPU-only, outputs 1024-dim features)
+#   ctc_head      → nn.Linear (the only trainable part)
 # ──────────────────────────────────────────────────────────────────────────────
 class IndicConformerCTCFinetune(nn.Module):
-    def __init__(self, base_model, vocab_size: int, encoder_dim: int = 512):
+    ENCODER_DIM = 1024  # IndicConformer-600M encoder output dimension
+
+    def __init__(self, base_model, vocab_size: int):
         super().__init__()
         self.base = base_model
-        # Replace / add Odia-specific CTC head
-        self.ctc_head = nn.Linear(encoder_dim, vocab_size)
+        self.ctc_head = nn.Linear(self.ENCODER_DIM, vocab_size)
         self.ctc_loss = nn.CTCLoss(
             blank=BLANK_IDX, reduction="mean", zero_infinity=True
         )
+        # Encoder is ONNX (no gradients); freeze all base parameters
+        for p in self.base.parameters():
+            p.requires_grad = False
 
     def forward(self, wavs: torch.Tensor, wav_lengths: torch.Tensor):
         """
         wavs:        (B, T) float32
-        wav_lengths: (B,)  int
+        wav_lengths: (B,)  int64
 
         Returns:
-          log_probs:    (T', B, V)   for CTCLoss
-          input_lengths: (B,)
+          log_probs:    (T', B, V)  for CTCLoss
+          enc_lengths:  (B,)
         """
-        # IndicConformer exposes internal encoder via base.encoder
-        # We bypass the decoding step and grab encoder outputs directly
-        device = wavs.device
-        wavs_3d = wavs.unsqueeze(1)  # (B, 1, T) — expected by many conformers
+        # Step 1: Preprocessor (TorchScript baked to cuda:0)
+        pre = self.base.models["preprocessor"]
+        enc_sess = self.base.models["encoder"]
 
-        with torch.set_grad_enabled(self.training):
-            # Try NeMo-style encoder call
-            try:
-                enc_out, enc_len = self.base.encoder(
-                    audio_signal=wavs_3d,
-                    length=wav_lengths,
-                )
-            except TypeError:
-                # Some wrappers take (wav, length) positionally
-                enc_out, enc_len = self.base.encoder(wavs_3d, wav_lengths)
+        mel, mel_len = pre(wavs.cuda(), wav_lengths.cuda())
+        # mel:     (B, 80, T_mel) on CUDA
+        # mel_len: (B,)           on CUDA
 
-        # enc_out: (B, D, T') or (B, T', D)
-        if enc_out.dim() == 3 and enc_out.shape[1] == enc_out.shape[-1]:
-            # ambiguous — assume (B, T', D) if D == vocab head in
-            pass
-        if enc_out.shape[1] != enc_len.max():
-            # shape is (B, D, T') — transpose to (B, T', D)
-            enc_out = enc_out.transpose(1, 2)
+        # Step 2: ONNX encoder on GPU (CUDAExecutionProvider)
+        enc_sess = self.base.models["encoder"]
+        mel_np = mel.cpu().numpy().astype(np.float32)        # (B, 80, T_mel)
+        mel_len_np = mel_len.cpu().numpy().astype(np.int64)  # (B,)
 
-        logits = self.ctc_head(enc_out)          # (B, T', V)
-        log_probs = logits.log_softmax(-1)       # (B, T', V)
-        log_probs = log_probs.transpose(0, 1)    # (T', B, V)  for CTCLoss
+        # Use CUDAExecutionProvider IO binding to keep data on GPU where possible
+        enc_np, enc_len_np = enc_sess.run(
+            None, {"audio_signal": mel_np, "length": mel_len_np}
+        )
+        # enc_np:     (B, 1024, T')
+        # enc_len_np: (B,)
+
+        # Step 3: Move back to training device, transpose to (B, T', 1024)
+        device = self.ctc_head.weight.device
+        enc_out = torch.from_numpy(enc_np).to(device).transpose(1, 2)   # (B, T', 1024)
+        enc_len = torch.from_numpy(enc_len_np).to(device)               # (B,)
+
+        # Step 4: CTC head (the only trained layer)
+        logits = self.ctc_head(enc_out)                       # (B, T', V)
+        log_probs = logits.log_softmax(-1).transpose(0, 1)   # (T', B, V)
 
         return log_probs, enc_len
 
@@ -319,11 +336,20 @@ def train(cfg: dict):
         target_sr=cfg["target_sr"], source_sr=cfg["source_sr"],
         max_secs=cfg["max_audio_secs"], min_secs=cfg["min_audio_secs"],
     )
+    # OpenSLR test set (always used)
     test_ds = OdiaASRDataset(
         cfg["test_manifest"], tokenizer,
         target_sr=cfg["target_sr"], source_sr=cfg["source_sr"],
         max_secs=cfg["max_audio_secs"], min_secs=cfg["min_audio_secs"],
     )
+    # IWSLT 2026 test set (used if manifest exists)
+    iwslt_ds = None
+    if cfg.get("iwslt_manifest") and os.path.exists(cfg["iwslt_manifest"]):
+        iwslt_ds = OdiaASRDataset(
+            cfg["iwslt_manifest"], tokenizer,
+            target_sr=cfg["target_sr"], source_sr=cfg["target_sr"],  # IWSLT is already 16kHz
+            max_secs=cfg["max_audio_secs"], min_secs=0.0,
+        )
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg["batch_size"], shuffle=True,
@@ -334,6 +360,10 @@ def train(cfg: dict):
         test_ds, batch_size=cfg["batch_size"] * 2, shuffle=False,
         collate_fn=collate_fn, num_workers=cfg["num_workers"],
     )
+    iwslt_loader = DataLoader(
+        iwslt_ds, batch_size=cfg["batch_size"] * 2, shuffle=False,
+        collate_fn=collate_fn, num_workers=cfg["num_workers"],
+    ) if iwslt_ds is not None else None
 
     # ── Base model ─────────────────────────────────────────────────────────────
     print(f"\nLoading {cfg['model_id']} ...")
@@ -343,53 +373,62 @@ def train(cfg: dict):
 
     base = AutoModel.from_pretrained(cfg["model_id"], **hf_kwargs)
 
-    # Detect encoder output dimension
-    encoder_dim = 512  # default for 600M conformer
-    if hasattr(base, "encoder"):
-        for name, param in base.encoder.named_parameters():
-            if "weight" in name and param.dim() == 2:
-                encoder_dim = param.shape[0]
-                break
+    # Replace ONNX encoder session with CUDAExecutionProvider only (avoids TensorRT per-shape JIT)
+    if "encoder" in base.models and hasattr(base.models["encoder"], "get_providers"):
+        providers = base.models["encoder"].get_providers()
+        if "TensorrtExecutionProvider" in providers:
+            # Locate the encoder.onnx in the HuggingFace snapshot cache
+            from huggingface_hub import snapshot_download
+            snapshot_dir = snapshot_download(
+                cfg["model_id"],
+                token=cfg["hf_token"] or None,
+                ignore_patterns=["*.bin", "*.safetensors"],
+            )
+            enc_path = os.path.join(snapshot_dir, "assets", "encoder.onnx")
+            sess_opts = ort.SessionOptions()
+            sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            base.models["encoder"] = ort.InferenceSession(
+                enc_path,
+                sess_options=sess_opts,
+                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            )
+            print(f"Switched encoder session → CUDAExecutionProvider (no TensorRT).")
+        else:
+            print(f"Encoder providers: {providers}")
 
-    model = IndicConformerCTCFinetune(base, len(tokenizer), encoder_dim)
-    model = model.to(device)
+    # Encoder is ONNX (1024-dim output); only the CTC head is trainable
+    model = IndicConformerCTCFinetune(base, len(tokenizer))
+    model.ctc_head = model.ctc_head.to(device)
 
-    # Freeze encoder for first N epochs
-    def set_encoder_grad(requires_grad: bool):
-        for p in model.base.encoder.parameters():
-            p.requires_grad = requires_grad
-
-    set_encoder_grad(False)
-    print(f"Encoder frozen for first {cfg['freeze_encoder_epochs']} epochs")
-
-    # ── Optimizer ──────────────────────────────────────────────────────────────
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=cfg["learning_rate"], weight_decay=1e-4)
+    # ── Optimizer (CTC head only) ──────────────────────────────────────────────
+    optimizer = torch.optim.AdamW(
+        model.ctc_head.parameters(), lr=cfg["learning_rate"], weight_decay=1e-4
+    )
 
     total_steps = (len(train_loader) // cfg["grad_accum"]) * cfg["max_epochs"]
     scheduler = get_scheduler(optimizer, cfg["warmup_steps"], total_steps)
 
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
+    # ── Warm up the ONNX CUDA kernels (avoids multi-minute JIT on first batch) ─
+    if device.type == "cuda":
+        print("Warming up ONNX CUDA kernels (2 passes)...")
+        _pre = base.models["preprocessor"]
+        _enc = base.models["encoder"]
+        _dummy_wav = torch.zeros(2, 32000, device="cuda")
+        _dummy_len = torch.tensor([32000, 32000], dtype=torch.long, device="cuda")
+        for _ in range(2):
+            _m, _ml = _pre(_dummy_wav, _dummy_len)
+            _enc.run(None, {"audio_signal": _m.cpu().numpy().astype(np.float32),
+                            "length": _ml.cpu().numpy().astype(np.int64)})
+        del _dummy_wav, _dummy_len, _m, _ml
+        print("Warm-up complete.")
+
     # ── Training loop ──────────────────────────────────────────────────────────
     best_wer = float("inf")
     global_step = 0
 
     for epoch in range(1, cfg["max_epochs"] + 1):
-
-        # Unfreeze encoder after freeze period
-        if epoch == cfg["freeze_encoder_epochs"] + 1:
-            set_encoder_grad(True)
-            # Re-init optimizer with all params
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=cfg["learning_rate"] / 10,  # lower LR for encoder
-                weight_decay=1e-4,
-            )
-            scheduler = get_scheduler(optimizer, cfg["warmup_steps"], total_steps)
-            if scaler.is_enabled():
-                scaler = torch.cuda.amp.GradScaler()
-            print(f"\nEpoch {epoch}: Encoder unfrozen (LR = {cfg['learning_rate']/10:.2e})")
 
         model.train()
         epoch_loss = 0.0
@@ -410,7 +449,7 @@ def train(cfg: dict):
 
             if step % cfg["grad_accum"] == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.ctc_head.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
@@ -431,29 +470,49 @@ def train(cfg: dict):
         print(f"\nEpoch {epoch} complete — avg loss: {avg_loss:.4f}")
 
         if epoch % cfg["eval_every_n_epochs"] == 0:
+            # Evaluate on OpenSLR test set
             wer = evaluate(model, test_loader, tokenizer, device)
-            print(f"  Test WER: {wer * 100:.2f}%")
+            print(f"  [OpenSLR]  Test WER: {wer * 100:.2f}%")
 
-            ckpt_path = os.path.join(cfg["output_dir"], f"epoch{epoch}_wer{wer*100:.1f}.pt")
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "wer": wer,
-                    "model_state": model.state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
-                    "config": cfg,
-                },
-                ckpt_path,
-            )
-            print(f"  Saved checkpoint: {ckpt_path}")
+            # Evaluate on IWSLT 2026 test set
+            iwslt_wer = None
+            if iwslt_loader is not None:
+                iwslt_wer = evaluate(model, iwslt_loader, tokenizer, device)
+                print(f"  [IWSLT26]  Test WER: {iwslt_wer * 100:.2f}%")
 
+            # Track best by OpenSLR WER (primary)
             if wer < best_wer:
                 best_wer = wer
                 best_path = os.path.join(cfg["output_dir"], "best_model.pt")
-                torch.save(model.state_dict(), best_path)
-                print(f"  *** New best WER: {best_wer * 100:.2f}% → {best_path}")
+                extra = f", iwslt_wer={iwslt_wer*100:.2f}%" if iwslt_wer is not None else ""
+                torch.save({
+                    "ctc_head": model.ctc_head.state_dict(),
+                    "openslr_wer": best_wer,
+                    "iwslt_wer": iwslt_wer,
+                    "epoch": epoch,
+                    "config": cfg,
+                }, best_path)
+                print(f"  *** New best WER: {best_wer * 100:.2f}%{extra} → {best_path}")
 
-    print(f"\nTraining complete. Best WER: {best_wer * 100:.2f}%")
+                # Push best checkpoint to HuggingFace
+                if cfg.get("hf_push_repo"):
+                    try:
+                        from huggingface_hub import HfApi
+                        _api = HfApi(token=cfg["hf_token"] or None)
+                        msg = f"Epoch {epoch}: OpenSLR WER={best_wer*100:.2f}%"
+                        if iwslt_wer is not None:
+                            msg += f", IWSLT WER={iwslt_wer*100:.2f}%"
+                        _api.upload_file(
+                            path_or_fileobj=best_path,
+                            path_in_repo="best_model.pt",
+                            repo_id=cfg["hf_push_repo"],
+                            commit_message=msg,
+                        )
+                        print(f"  Pushed to https://huggingface.co/{cfg['hf_push_repo']}")
+                    except Exception as _e:
+                        print(f"  HF push failed: {_e}")
+
+    print(f"\nTraining complete. Best OpenSLR WER: {best_wer * 100:.2f}%")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -107,18 +107,24 @@ class CTCModel(nn.Module):
         self.ctc_head = nn.Linear(enc_dim, vocab_size)
 
     def encode(self, wavs: torch.Tensor, wav_lens: torch.Tensor):
-        wavs_3d = wavs.unsqueeze(1)
-        try:
-            enc, enc_len = self.base.encoder(audio_signal=wavs_3d, length=wav_lens)
-        except TypeError:
-            enc, enc_len = self.base.encoder(wavs_3d, wav_lens)
+        # Step 1: Run preprocessor (TorchScript) to get mel features
+        preprocessor = self.base.models["preprocessor"]
+        encoder_sess = self.base.models["encoder"]
+        mel, mel_len = preprocessor(wavs.cuda(), wav_lens.cuda())
+        # Step 2: Run ONNX encoder on mel features
+        mel_np = mel.cpu().numpy().astype("float32")
+        mel_len_np = mel_len.cpu().numpy().astype("int64")
+        enc_out = encoder_sess.run(None, {"audio_signal": mel_np, "length": mel_len_np})
+        enc = torch.tensor(enc_out[0])
+        enc_len = torch.tensor(enc_out[1])
         if enc.shape[1] != enc_len.max():
             enc = enc.transpose(1, 2)
         return enc, enc_len
 
     def forward(self, wavs: torch.Tensor, wav_lens: torch.Tensor):
         enc, enc_len = self.encode(wavs, wav_lens)
-        logits    = self.ctc_head(enc)
+        # Move enc to same device as ctc_head weights
+        logits = self.ctc_head(enc.to(self.ctc_head.weight.device))
         log_probs = logits.log_softmax(-1).transpose(0, 1)
         return log_probs, enc_len
 
@@ -414,9 +420,11 @@ def load_audio(
 ) -> Optional[torch.Tensor]:
     if not os.path.exists(wav_path):
         return None
+    import soundfile as sf
     try:
-        wav, sr = torchaudio.load(wav_path)
-        wav = wav.mean(0)  # → mono
+        wav, sr = sf.read(wav_path)
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)  # → mono
 
         # Trim to segment if offset/duration are specified
         if offset > 0 or duration > 0:
@@ -428,8 +436,10 @@ def load_audio(
                 wav = wav[start_frame:]
 
         if sr != target_sr:
-            wav = torchaudio.transforms.Resample(sr, target_sr)(wav)
-        return wav
+            import librosa
+            wav = librosa.resample(wav, orig_sr=sr, target_sr=target_sr)
+            sr = target_sr
+        return torch.tensor(wav, dtype=torch.float32)
     except Exception as e:
         print(f"  [WARN] Could not load {wav_path}: {e}")
         return None
@@ -486,10 +496,37 @@ def evaluate(args):
     if not args.baseline:
         print(f"Loading checkpoint: {args.checkpoint}")
         state = torch.load(args.checkpoint, map_location=device)
-        if isinstance(state, dict) and "model_state" in state:
-            state = state["model_state"]
-        model.load_state_dict(state)
-        print("  Checkpoint loaded.")
+        # Robust patch: handle ctc_head as tensor, nn.Linear, dict, or raw dict
+        if isinstance(state, dict):
+            if "ctc_head" in state:
+                ctc = state["ctc_head"]
+                state_dict = {}
+                # Handle nn.Linear
+                if hasattr(ctc, "weight") and hasattr(ctc, "bias"):
+                    state_dict["ctc_head.weight"] = ctc.weight
+                    state_dict["ctc_head.bias"] = ctc.bias
+                # Handle dict
+                elif isinstance(ctc, dict):
+                    state_dict["ctc_head.weight"] = ctc.get("weight")
+                    state_dict["ctc_head.bias"] = ctc.get("bias")
+                # Handle tuple/list
+                elif isinstance(ctc, (tuple, list)) and len(ctc) == 2:
+                    state_dict["ctc_head.weight"] = ctc[0]
+                    state_dict["ctc_head.bias"] = ctc[1]
+                # Handle tensor (weight only)
+                elif hasattr(ctc, "shape"):
+                    state_dict["ctc_head.weight"] = ctc
+                model.load_state_dict(state_dict, strict=False)
+                print("  Checkpoint loaded (ctc_head weights, robust patch).")
+            elif "model_state" in state:
+                model.load_state_dict(state["model_state"])
+                print("  Checkpoint loaded (model_state).")
+            else:
+                model.load_state_dict(state, strict=False)
+                print("  Checkpoint loaded (raw dict).")
+        else:
+            model.load_state_dict(state, strict=False)
+            print("  Checkpoint loaded (raw object).")
     else:
         print("  Running baseline (no fine-tuning weights loaded).")
 
